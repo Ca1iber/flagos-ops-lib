@@ -22,7 +22,8 @@ from flag_gems.utils import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
-
+# 把单个元素计算包装成处理整个 tensor 的算子
+# 自动处理张量的逐元素遍历、广播和读写
 @pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")])
 @triton.jit
 def silu_and_mul_kernel(x, y):

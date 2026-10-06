@@ -76,6 +76,9 @@ logger = logging.getLogger(__name__)
 
 DEVICE_COUNT = runtime.device.device_count
 
+_MM_TILE_DIAG = os.environ.get("FLAGGEMS_MM_TILE_DIAG") == "1"
+_MM_TILE_DIAG_SEEN = set()
+
 version = triton.__version__.split(".")
 major_version, minor_version = eval(version[0]), eval(version[1])
 
@@ -1744,6 +1747,34 @@ class LibEntry(triton.KernelInterface):
                     heur_constexprs,
                     tuple(launch_pre_hooks),
                 )
+                if _MM_TILE_DIAG:
+                    kernel_name = self.jit_function.fn.__name__
+                    if kernel_name in {
+                        "mm_kernel",
+                        "mm_kernel_nn",
+                        "mm_kernel_nt",
+                        "mm_kernel_splitk",
+                        "mm_kernel_splitk_partial",
+                    }:
+                        m, n, k = args[3:6]
+                        tile = tuple(
+                            constexprs.get(name)
+                            for name in (
+                                "BLOCK_M", "BLOCK_N", "BLOCK_K",
+                                "SPLIT_K", "num_warps", "num_stages",
+                            )
+                        )
+                        diagnostic_key = (kernel_name, m, n, k, tile)
+                        if diagnostic_key not in _MM_TILE_DIAG_SEEN:
+                            _MM_TILE_DIAG_SEEN.add(diagnostic_key)
+                            path = f"/tmp/flagos_mm_tile_diag_{os.getpid()}.log"
+                            with open(path, "a", encoding="utf-8") as output:
+                                output.write(
+                                    f"kernel={kernel_name} M={m} N={n} K={k} "
+                                    f"BLOCK_M={tile[0]} BLOCK_N={tile[1]} "
+                                    f"BLOCK_K={tile[2]} SPLIT_K={tile[3]} "
+                                    f"num_warps={tile[4]} num_stages={tile[5]}\n"
+                                )
             return kernel, constexprs
 
         (

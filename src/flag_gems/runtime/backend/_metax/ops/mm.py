@@ -362,14 +362,24 @@ def mm_kernel_nt(
     grid_m = tl.cdiv(M, BLOCK_M)
     grid_n = tl.cdiv(N, BLOCK_N)
 
+    # width 是完整 M 分组包含的输出 tile（program）数量，而不是矩阵宽度。
+    # GROUP_M 为每组最多包含的 M-tile 数，组内按列编号以复用 B。
     width = GROUP_M * grid_n
     group_id = pid // width
+    # 最后一个 M 分组可能不足 GROUP_M 个 tile。
     group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    # 例如输出包含 4 行 x 3 列 tile，GROUP_M=2 时分组编号如下：
+    #             第0列  第1列  第2列
+    # 第0组 行0      0      2      4
+    #       行1      1      3      5
+    # 第1组 行2      6      8     10
+    #       行3      7      9     11
     pid_m = group_id * GROUP_M + pid % group_size
     pid_n = pid % width // group_size
-
+    # 将 tile 编号展开为具体行列索引。
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # 对齐与连续性提示帮助编译器优化访存，索引和边界处理逻辑不变。
     if EVEN_M:
         ram = tl.max_contiguous(tl.multiple_of(rm, BLOCK_M), BLOCK_M)
     else:
