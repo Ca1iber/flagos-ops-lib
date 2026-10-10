@@ -90,6 +90,17 @@ from flag_gems.fused.moe_sum import moe_sum
 from flag_gems.fused.mrope import mrope
 from flag_gems.fused.outer import outer
 from flag_gems.fused.pack_seq import pack_seq_triton
+from flag_gems.fused.packed_bundle import (
+    pack_linear_weight,
+    packed_lm_head,
+    packed_mlp,
+    packed_projection,
+)
+from flag_gems.fused.packed_swiglu import (
+    pack_gate_up_input,
+    pack_gate_up_weight,
+    packed_gate_up_silu,
+)
 from flag_gems.fused.reglu import dreglu, reglu
 from flag_gems.fused.reshape_and_cache import reshape_and_cache
 from flag_gems.fused.reshape_and_cache_flash import reshape_and_cache_flash
@@ -174,6 +185,13 @@ __all__ = [
     "outer",
     "outplace_fused_experts",
     "pack_seq_triton",
+    "pack_gate_up_input",
+    "pack_gate_up_weight",
+    "packed_gate_up_silu",
+    "pack_linear_weight",
+    "packed_projection",
+    "packed_mlp",
+    "packed_lm_head",
     "reglu",
     "reshape_and_cache",
     "reshape_and_cache_flash",

@@ -1174,6 +1174,12 @@ def _select_two_step_split_k(M, N, K):
 
 def mm(a, b):
     logger.debug("GEMS_METAX MM")
+    from flag_gems.runtime.prepared_callbacks import try_prepared_matmul
+
+    prepared = try_prepared_matmul(a, b)
+    if prepared is not None:
+        return prepared
+
     device = a.device
     # handle non-contiguous inputs if necessary
     if a.stride(0) > 1 and a.stride(1) > 1:
@@ -1206,6 +1212,12 @@ def mm(a, b):
 
 def mm_out(a, b, *, out):
     logger.debug("GEMS_METAX MM_OUT")
+    from flag_gems.runtime.prepared_callbacks import try_prepared_matmul
+
+    prepared = try_prepared_matmul(a, b, out=out)
+    if prepared is not None:
+        return prepared
+
     # handle non-contiguous inputs if necessary
     if a.stride(0) > 1 and a.stride(1) > 1:
         a = a.contiguous()

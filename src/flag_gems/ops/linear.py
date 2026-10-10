@@ -137,6 +137,12 @@ def linear(input, weight, bias=None):
     """
     logger.debug("GEMS LINEAR")
 
+    from flag_gems.runtime.prepared_callbacks import try_prepared_linear
+
+    prepared = try_prepared_linear(input, weight, bias)
+    if prepared is not None:
+        return prepared
+
     input_dim = input.dim()
     if input_dim == 1:
         # Single 1D input: treat as (1, in_features)
