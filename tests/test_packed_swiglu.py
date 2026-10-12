@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Contract tests for the fixed-shape, inference-only MetaX packed SwiGLU API."""
+"""Contract tests for the variable-row, inference-only MetaX packed SwiGLU API."""
 import pytest
 import torch
 
@@ -27,7 +27,7 @@ def test_packed_swiglu_weight_layout_cpu():
     torch.testing.assert_close(restored, w, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("shape", [(1, K), (64, K), (M, K - 1)])
+@pytest.mark.parametrize("shape", [(0, K), (M,), (1, 1, K), (M, K - 1)])
 def test_packed_swiglu_rejects_input_shape(shape):
     with pytest.raises(ValueError, match="shape"):
         flag_gems.pack_gate_up_input(torch.empty(shape, dtype=torch.bfloat16))

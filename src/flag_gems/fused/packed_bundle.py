@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fixed-shape BF16 packed kernels for the MiniCPM5-2B service candidate.
+"""Variable-row BF16 packed kernels with fixed MiniCPM5-2B channels.
 
 Weights and workspaces are caller-owned. These inference APIs have no model,
 weight, or workspace caches, and require warmup before graph capture.
@@ -17,10 +17,12 @@ from .packed_swiglu import (
     INPUT_PACKED_SHAPE,
     WEIGHT_PACKED_SHAPE,
     _check_tensor,
+    _input_rows,
     _overlaps,
     pack_gate_up_input,
 )
 
+# Legacy M2048 allocation constants; APIs derive actual rows from x.
 M, D, H = 2048, 2048, 6144
 ACTIVATION_PACKED_SHAPE = (96, 2048, 64)
 DOWN_PACKED_SHAPE = (32, 96, 64, 64)
@@ -33,6 +35,7 @@ def _packed_nt_kernel(
     A, B, C, M, N, K,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
     GROUP_M: tl.constexpr, PACK_A: tl.constexpr,
+    EVEN_M: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     gm, gn = tl.cdiv(M, BM), tl.cdiv(N, BN)
@@ -55,14 +58,22 @@ def _packed_nt_kernel(
     )
     acc = tl.zeros((BM, BN), tl.float32)
     for _ in range(tl.cdiv(K, BK)):
-        a, b = tl.load(ap), tl.load(bp)
+        if EVEN_M:
+            a = tl.load(ap)
+        else:
+            a = tl.load(ap, mask=rm[:, None] < M, other=0.0)
+        b = tl.load(bp)
         acc = tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=False)
         if PACK_A:
             ap += M * BK
         else:
             ap += BK
         bp += BN * BK
-    tl.store(C + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16))
+    if EVEN_M:
+        tl.store(C + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16))
+    else:
+        tl.store(C + rm[:, None] * N + rn[None, :], acc.to(tl.bfloat16),
+                 mask=rm[:, None] < M)
 
 
 @triton.jit
@@ -70,6 +81,7 @@ def _packed_gate_up_silu_kernel(
     XP, WB, Z, M, H, K,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
     GROUP_M: tl.constexpr,
+    EVEN_M: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     gm, gn = tl.cdiv(M, BM), tl.cdiv(H, BN)
@@ -86,7 +98,11 @@ def _packed_gate_up_silu_kernel(
     bp = WB + pn * (2 * BN) * K + wn[None, :] * BK + rk[:, None]
     acc = tl.zeros((BM, 2 * BN), tl.float32)
     for _ in range(tl.cdiv(K, BK)):
-        a, b = tl.load(ap), tl.load(bp)
+        if EVEN_M:
+            a = tl.load(ap)
+        else:
+            a = tl.load(ap, mask=rm[:, None] < M, other=0.0)
+        b = tl.load(bp)
         acc = tl.dot(a, b, acc, out_dtype=tl.float32, allow_tf32=False)
         ap += M * BK
         bp += (2 * BN) * BK
@@ -95,7 +111,10 @@ def _packed_gate_up_silu_kernel(
     # Equivalent real arithmetic is not necessarily identical FP32 arithmetic.
     result = gate * tl.sigmoid(gate) * up
     offset = pn * M * BN + rm[:, None] * BN + tl.arange(0, BN)[None, :]
-    tl.store(Z + offset, result.to(tl.bfloat16))
+    if EVEN_M:
+        tl.store(Z + offset, result.to(tl.bfloat16))
+    else:
+        tl.store(Z + offset, result.to(tl.bfloat16), mask=rm[:, None] < M)
 
 
 @triton.jit
@@ -204,9 +223,9 @@ def pack_linear_weight(weight, *, panel_n: int, block_k: int):
 
 
 def packed_projection(x, packed_weight, *, out=None):
-    """Compute row-major BF16 [2048,N], N=2560 or 2048, from K32/N128 weights."""
+    """Compute BF16 [M,N] for positive M, N=2560 or 2048, using packed weights."""
     _check_device(x)
-    _check_tensor(x, (M, D), "x", contiguous=True)
+    m = _input_rows(x, D, contiguous=True)
     if packed_weight.ndim != 4:
         raise ValueError("packed weight must have shape [N/128, 64, 128, 32]")
     n = packed_weight.shape[0] * 128
@@ -217,15 +236,15 @@ def packed_projection(x, packed_weight, *, out=None):
         contiguous=True, device=x.device,
     )
     if out is not None:
-        _check_tensor(out, (M, n), "out", contiguous=True, device=x.device)
+        _check_tensor(out, (m, n), "out", contiguous=True, device=x.device)
         _check_writes((("x", x), ("packed weight", packed_weight)), (("out", out),))
     _check_inference(x, packed_weight, out)
     with torch_device_fn.device(x.device):
         if out is None:
-            out = torch.empty((M, n), dtype=x.dtype, device=x.device)
-        _packed_nt_kernel[(M // 128 * (n // 128),)](
-            x, packed_weight, out, M, n, D,
-            BM=128, BN=128, BK=32, GROUP_M=8, PACK_A=False,
+            out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+        _packed_nt_kernel[(triton.cdiv(m, 128) * (n // 128),)](
+            x, packed_weight, out, m, n, D,
+            BM=128, BN=128, BK=32, GROUP_M=8, PACK_A=False, EVEN_M=(m % 128 == 0),
             num_warps=8, num_stages=2,
         )
     return out
@@ -235,14 +254,14 @@ def packed_mlp(
     x, gate_packed, down_packed, *,
     input_workspace, activation_workspace, out=None,
 ):
-    """Compute the M2048/D2048/H6144 MLP with caller-owned K32 input/K64 Z.
+    """Compute a positive-M/D2048/H6144 MLP using caller-owned K32 input/K64 Z.
 
     After the input copy, gate/up plus SiLU writes packed BF16 Z directly;
     a separate down GEMM consumes Z and packed down weights. The projection
     rounds to BF16 before FP32 activation and the BF16 Z boundary.
     """
     _check_device(x)
-    _check_tensor(x, (M, D), "x", contiguous=True)
+    m = _input_rows(x, D, contiguous=True)
     _check_tensor(
         gate_packed, WEIGHT_PACKED_SHAPE, "gate packed weight",
         contiguous=True, device=x.device,
@@ -252,11 +271,11 @@ def packed_mlp(
         contiguous=True, device=x.device,
     )
     _check_tensor(
-        input_workspace, INPUT_PACKED_SHAPE, "input workspace",
+        input_workspace, (D // 32, m, 32), "input workspace",
         contiguous=True, device=x.device,
     )
     _check_tensor(
-        activation_workspace, ACTIVATION_PACKED_SHAPE, "activation workspace",
+        activation_workspace, (H // 64, m, 64), "activation workspace",
         contiguous=True, device=x.device,
     )
     writes = (
@@ -264,7 +283,7 @@ def packed_mlp(
         ("activation workspace", activation_workspace),
     )
     if out is not None:
-        _check_tensor(out, (M, D), "out", contiguous=True, device=x.device)
+        _check_tensor(out, (m, D), "out", contiguous=True, device=x.device)
         writes += (("out", out),)
     _check_inference(
         x, gate_packed, down_packed, input_workspace, activation_workspace, out,
@@ -275,16 +294,16 @@ def packed_mlp(
     )
     with torch_device_fn.device(x.device):
         if out is None:
-            out = torch.empty((M, D), dtype=x.dtype, device=x.device)
+            out = torch.empty((m, D), dtype=x.dtype, device=x.device)
         xp = pack_gate_up_input(x, out=input_workspace)
-        _packed_gate_up_silu_kernel[(1536,)](
-            xp, gate_packed, activation_workspace, M, H, D,
-            BM=128, BN=64, BK=32, GROUP_M=8,
+        _packed_gate_up_silu_kernel[(triton.cdiv(m, 128) * (H // 64),)](
+            xp, gate_packed, activation_workspace, m, H, D,
+            BM=128, BN=64, BK=32, GROUP_M=8, EVEN_M=(m % 128 == 0),
             num_warps=8, num_stages=2,
         )
-        _packed_nt_kernel[(1024,)](
-            activation_workspace, down_packed, out, M, D, H,
-            BM=64, BN=64, BK=64, GROUP_M=8, PACK_A=True,
+        _packed_nt_kernel[(triton.cdiv(m, 64) * (D // 64),)](
+            activation_workspace, down_packed, out, m, D, H,
+            BM=64, BN=64, BK=64, GROUP_M=8, PACK_A=True, EVEN_M=(m % 64 == 0),
             num_warps=4, num_stages=4,
         )
     return out

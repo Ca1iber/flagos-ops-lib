@@ -100,7 +100,7 @@ def _host_namespace(events):
         "torch_device_fn": SimpleNamespace(device=lambda _: nullcontext()),
         "triton": SimpleNamespace(cdiv=lambda a, b: (a + b - 1) // b),
     }
-    _execute_host_nodes(SWIGLU, namespace, {"_check_tensor", "_overlaps", "pack_gate_up_input"})
+    _execute_host_nodes(SWIGLU, namespace, {"_check_tensor", "_input_rows", "_overlaps", "pack_gate_up_input"})
     _execute_host_nodes(BUNDLE, namespace)
     for name in ("_packed_nt_kernel", "_packed_gate_up_silu_kernel", "_packed_lm_head_kernel"):
         namespace[name] = _KernelRecorder(events, name)
@@ -172,21 +172,21 @@ class PackedBundleHostTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlap"):
             self.host["pack_gate_up_input"](x, out=x.reshape(64, 2048, 32))
 
-    def _projection(self, n=2048):
+    def _projection(self, n=2048, m=2048):
         return {
-            "x": _TensorMetadata((2048, 2048)),
+            "x": _TensorMetadata((m, 2048)),
             "packed_weight": _TensorMetadata((n // 128, 64, 128, 32)),
-            "out": _TensorMetadata((2048, n)),
+            "out": _TensorMetadata((m, n)),
         }
 
-    def _mlp(self):
+    def _mlp(self, m=2048):
         return {
-            "x": _TensorMetadata((2048, 2048)),
+            "x": _TensorMetadata((m, 2048)),
             "gate_packed": _TensorMetadata((96, 64, 128, 32)),
             "down_packed": _TensorMetadata((32, 96, 64, 64)),
-            "input_workspace": _TensorMetadata((64, 2048, 32)),
-            "activation_workspace": _TensorMetadata((96, 2048, 64)),
-            "out": _TensorMetadata((2048, 2048)),
+            "input_workspace": _TensorMetadata((64, m, 32)),
+            "activation_workspace": _TensorMetadata((96, m, 64)),
+            "out": _TensorMetadata((m, 2048)),
         }
 
     def _lm_head(self, m=8):
@@ -265,7 +265,7 @@ class PackedBundleHostTests(unittest.TestCase):
             _, grid, _, config = self.events.pop()
             self.assertEqual(grid, (16 * (n // 128),))
             self.assertEqual(config, dict(BM=128, BN=128, BK=32, GROUP_M=8,
-                                          PACK_A=False, num_warps=8, num_stages=2))
+                                          PACK_A=False, EVEN_M=True, num_warps=8, num_stages=2))
 
     def test_mlp_copy_then_two_compute_kernels(self):
         def copy_input(x, *, out):
@@ -284,9 +284,43 @@ class PackedBundleHostTests(unittest.TestCase):
         self.assertIs(gate_args[2], arguments["activation_workspace"])
         self.assertIs(down_args[0], arguments["activation_workspace"])
         self.assertEqual(gate_config, dict(BM=128, BN=64, BK=32, GROUP_M=8,
-                                           num_warps=8, num_stages=2))
+                                           EVEN_M=True, num_warps=8, num_stages=2))
         self.assertEqual(down_config, dict(BM=64, BN=64, BK=64, GROUP_M=8,
-                                           PACK_A=True, num_warps=4, num_stages=4))
+                                           PACK_A=True, EVEN_M=True, num_warps=4, num_stages=4))
+
+    def test_variable_rows_launch_grid_masks_and_argument_contracts(self):
+        self.host["pack_gate_up_input"] = lambda x, *, out: out
+        for m in (1, 63, 64, 65, 127, 128, 129, 511, 512, 513,
+                  565, 576, 1025, 1152, 1537, 1664, 1920, 2047, 2048):
+            for n in (2048, 2560):
+                args = self._projection(n, m)
+                self.assertIs(self.host["packed_projection"](**args), args["out"])
+                _, grid, launch, cfg = self.events.pop()
+                self.assertEqual(grid, (((m + 127) // 128) * (n // 128),))
+                self.assertEqual(launch[3:6], (m, n, 2048))
+                self.assertEqual(cfg["EVEN_M"], m % 128 == 0)
+            args = self._mlp(m)
+            self.assertIs(self.host["packed_mlp"](**args), args["out"])
+            _, down_grid, down_args, down_cfg = self.events.pop()
+            _, gate_grid, gate_args, gate_cfg = self.events.pop()
+            self.assertEqual(gate_grid, (((m + 127) // 128) * 96,))
+            self.assertEqual(down_grid, (((m + 63) // 64) * 32,))
+            self.assertEqual(gate_args[3:6], (m, 6144, 2048))
+            self.assertEqual(down_args[3:6], (m, 2048, 6144))
+            self.assertEqual(gate_cfg["EVEN_M"], m % 128 == 0)
+            self.assertEqual(down_cfg["EVEN_M"], m % 64 == 0)
+        self.assertEqual(self.events, [])
+
+    def test_variable_rows_input_pack_roundtrip_and_invalid_rows(self):
+        for m in (1, 65, 565, 576, 1537, 2047, 2048):
+            x = (torch.arange(m * 2048).reshape(m, 2048) % 127).to(torch.bfloat16)
+            out = torch.empty((64, m, 32), dtype=x.dtype)
+            result = self.host["pack_gate_up_input"](x, out=out)
+            self.assertIs(result, out)
+            self.assertTrue(torch.equal(result.permute(1, 0, 2).reshape_as(x), x))
+        for shape in ((0, 2048), (2048,), (1, 1, 2048), (65, 2047)):
+            with self.subTest(shape=shape), self.assertRaisesRegex(ValueError, "shape"):
+                self.host["pack_gate_up_input"](torch.empty(shape, dtype=torch.bfloat16))
 
     def test_optional_output_allocation_is_host_metadata_only(self):
         allocations = []
@@ -368,6 +402,26 @@ class PackedBundleStaticTests(unittest.TestCase):
             ("output_mask_n", "offs_n < N"),
         ):
             self.assertEqual(values[name], _expr(expected))
+
+    def test_tail_masks_exist_with_unmasked_full_tile_branch(self):
+        for path, name in ((BUNDLE, "_packed_nt_kernel"),
+                           (BUNDLE, "_packed_gate_up_silu_kernel"),
+                           (SWIGLU, "packed_gate_up_silu_kernel")):
+            fn = _function(_tree(path), name)
+            self.assertIn("EVEN_M", [a.arg for a in fn.args.args])
+            branches = [n for n in ast.walk(fn) if isinstance(n, ast.If)
+                        and isinstance(n.test, ast.Name) and n.test.id == "EVEN_M"]
+            self.assertEqual(len(branches), 2)
+            accesses = {"load": [], "store": []}
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    if node.func.attr in accesses:
+                        accesses[node.func.attr].append(node)
+            for kind in ("load", "store"):
+                masks = [kw.value for call in accesses[kind] for kw in call.keywords
+                         if kw.arg == "mask"]
+                self.assertEqual(len(masks), 1)
+                self.assertEqual(ast.dump(masks[0]), _expr("rm[:, None] < M"))
 
     def test_launch_host_code_has_no_synchronization_or_host_data_reads(self):
         banned = {"synchronize", "item", "tolist", "numpy", "cpu", "print", "manual_seed"}
