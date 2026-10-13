@@ -222,35 +222,49 @@ def sweep(
         tl.store(status_ptr + status_offset, pack0, cache_modifier=".cg")
 
         # decoupled lookback
+        # 还没查自己前面的桶 bin_index 有多少个元素，所以计数为 0 
         exclusive_prefix = tl.zeros((), dtype=tl.uint32)
+        # 插前面的那块
         i_lookback = pid_n - 1
+        # 进入循环，读取第二块的记录
         while i_lookback >= 0:
             flag_offset_i = pid_m * (r * OUT_N) + bin_index * OUT_N + i_lookback
+            # pack1 就是读回来的记录，有可能是“我自己有多少个：01”，也可能是“截止我之前总共有多少个：10”
             pack1 = tl.load(status_ptr + flag_offset_i, volatile=True)  # uin32
+            # 没读到就一直读
             while pack1 == 0:
                 pack1 = tl.load(status_ptr + flag_offset_i, volatile=True)
+            # 把督导的数量加进计数器
             exclusive_prefix += pack1 & v_mask
+            # 判断读到的是“我有”还是“截止我共有”
             if (pack1 & aggregate_mask) == aggregate_mask:
                 i_lookback -= 1
             else:
                 i_lookback = -1
+        # 退出了刚才的 while 循环，意味着当前 CTA 已经拿到了当前桶在所有前面的数据块中的完整数量
+        # 算出“截止我共有”的数量并给这个数量贴上“截止我共有”的标签
         pack2 = inclusive_prefix_mask | (exclusive_prefix + local_sum)
+        # 覆盖之前的标签
         tl.store(status_ptr + status_offset, pack2, cache_modifier=".cg")
-
+        # 算出他们在本块内的先后编号，l_e_c 表示在本数据块内，自己前面有几个同桶元素
         local_ex_cumsum = (
             tl.cumsum(matches.to(tl.uint32), axis=0) - matches
         )  # (TILE_N, )
+        # 加上前面数据块的同桶数量，得到这一数据块里这个桶在整个对应编号桶内部的编号
         ex_cumsum_in_bin = (
             exclusive_prefix + local_ex_cumsum
         )  # global ex_cumsum_in_bin (TILE_N, )
 
         # ex_cumsum_bins (m, n_passes, r)
+        # 加上这个桶在输出中的起点
         ex_cumsum_bins = tl.load(
             excumsum_bins_ptr + pid_m * (n_passes * r) + pass_id * r + bin_index
         )  # scalar
+        # 得到最终输出的下标
         pos = ex_cumsum_bins + ex_cumsum_in_bin  # (TILE_N, )
 
         # scatter
+        # 只写出属于当前桶的元素
         tl.store(out_ptr + pid_m * N + pos, arr, mask=matches)
         if associate_arr_ptr is not None:
             tl.store(associate_out_ptr + pid_m * N + pos, associate_arr, mask=matches)
