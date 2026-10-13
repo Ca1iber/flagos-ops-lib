@@ -256,6 +256,19 @@ def sweep(
             tl.store(associate_out_ptr + pid_m * N + pos, associate_arr, mask=matches)
 
 
+@triton.jit
+def _histogram_exclusive_scan_kernel(
+    hist_ptr, prefix_ptr, NUM_BINS: tl.constexpr
+):
+    # radix_sort bounds each nonnegative row sum by n < 2**30.
+    # Keep address arithmetic wide; only bounded counts/prefixes use INT32.
+    row = tl.program_id(0).to(tl.int64)
+    bins = tl.arange(0, NUM_BINS)
+    counts = tl.load(hist_ptr + row * NUM_BINS + bins).to(tl.int32)
+    prefix = tl.cumsum(counts, axis=0) - counts
+    tl.store(prefix_ptr + row * NUM_BINS + bins, prefix.to(tl.uint32))
+
+
 def radix_sort(arr, k_bits=8, descending=False):
     n = arr.shape[-1]
     m = arr.numel() // n
@@ -290,13 +303,15 @@ def radix_sort(arr, k_bits=8, descending=False):
             k_bits,
             descending,
         )
-        ex_cumsum_bins = torch.cumsum(global_hist, -1) - global_hist
-        ex_cumsum_bins = ex_cumsum_bins.to(torch.uint32)
+        ex_cumsum_bins = torch.empty_like(global_hist, dtype=torch.uint32)
+        _histogram_exclusive_scan_kernel[(m * n_passes,)](
+            global_hist, ex_cumsum_bins, NUM_BINS=num_bins, num_warps=4
+        )
 
         # sort
         arr_in = torch.clone(arr)
         indices_in = (
-            torch.arange(0, n, dtype=torch.int64, device=arr_in.device)
+            torch.arange(0, n, dtype=torch.int32, device=arr_in.device)
             .broadcast_to(arr.shape)
             .contiguous()
         )
@@ -314,6 +329,10 @@ def radix_sort(arr, k_bits=8, descending=False):
         )
 
         for i in range(0, n_passes):
+            if i == n_passes - 1:
+                # Intermediate indices are bounded by n-1 < 2**30.
+                # Widen on the last sweep store to preserve torch.sort's API.
+                indices_out = torch.empty_like(indices_in, dtype=torch.int64)
             bit_offset = i * k_bits
             status.zero_()
             sweep[grid_for_sweep](
