@@ -246,28 +246,30 @@ def sweep(
         pack2 = inclusive_prefix_mask | (exclusive_prefix + local_sum)
         # 覆盖之前的标签
         tl.store(status_ptr + status_offset, pack2, cache_modifier=".cg")
-        # 算出他们在本块内的先后编号，l_e_c 表示在本数据块内，自己前面有几个同桶元素
-        local_ex_cumsum = (
-            tl.cumsum(matches.to(tl.uint32), axis=0) - matches
-        )  # (TILE_N, )
-        # 加上前面数据块的同桶数量，得到这一数据块里这个桶在整个对应编号桶内部的编号
-        ex_cumsum_in_bin = (
-            exclusive_prefix + local_ex_cumsum
-        )  # global ex_cumsum_in_bin (TILE_N, )
+        # Empty bins must still publish both status states above.
+        if local_sum != 0:
+            # 算出他们在本块内的先后编号，l_e_c 表示在本数据块内，自己前面有几个同桶元素
+            local_ex_cumsum = (
+                tl.cumsum(matches.to(tl.uint32), axis=0) - matches
+            )  # (TILE_N, )
+            # 加上前面数据块的同桶数量，得到这一数据块里这个桶在整个对应编号桶内部的编号
+            ex_cumsum_in_bin = (
+                exclusive_prefix + local_ex_cumsum
+            )  # global ex_cumsum_in_bin (TILE_N, )
 
-        # ex_cumsum_bins (m, n_passes, r)
-        # 加上这个桶在输出中的起点
-        ex_cumsum_bins = tl.load(
-            excumsum_bins_ptr + pid_m * (n_passes * r) + pass_id * r + bin_index
-        )  # scalar
-        # 得到最终输出的下标
-        pos = ex_cumsum_bins + ex_cumsum_in_bin  # (TILE_N, )
+            # ex_cumsum_bins (m, n_passes, r)
+            # 加上这个桶在输出中的起点
+            ex_cumsum_bins = tl.load(
+                excumsum_bins_ptr + pid_m * (n_passes * r) + pass_id * r + bin_index
+            )  # scalar
+            # 得到最终输出的下标
+            pos = ex_cumsum_bins + ex_cumsum_in_bin  # (TILE_N, )
 
-        # scatter
-        # 只写出属于当前桶的元素
-        tl.store(out_ptr + pid_m * N + pos, arr, mask=matches)
-        if associate_arr_ptr is not None:
-            tl.store(associate_out_ptr + pid_m * N + pos, associate_arr, mask=matches)
+            # scatter
+            # 只写出属于当前桶的元素
+            tl.store(out_ptr + pid_m * N + pos, arr, mask=matches)
+            if associate_arr_ptr is not None:
+                tl.store(associate_out_ptr + pid_m * N + pos, associate_arr, mask=matches)
 
 
 @triton.jit
