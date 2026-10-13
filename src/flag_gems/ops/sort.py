@@ -24,6 +24,7 @@ from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
+DETECTOR_WORDS = 2
 
 def unwrap_if_constexpr(o):
     return o.value if isinstance(o, tl.constexpr) else o
@@ -106,6 +107,11 @@ def convert_to_uint_preverse_order(x: tl.tensor, descending: tl.constexpr = Fals
         out = uint_to_uint(x, descending)
     return out
 
+@triton.jit
+def _combine_or(a, b):
+    return a | b
+
+
 
 @triton.jit
 def compute_global_hist_kernel(
@@ -119,6 +125,7 @@ def compute_global_hist_kernel(
     TILE_R: tl.constexpr,
     num_bits_per_pass: tl.constexpr,
     descending: tl.constexpr,
+    identity_mismatch_ptr=None, KEY_BITS: tl.constexpr=32,
 ):
     # arr_ptr: (m, n)
     # out_ptr: (m, n_passes, r), where r = 2 ** k_bits is the number of bins
@@ -134,6 +141,10 @@ def compute_global_hist_kernel(
 
     for p in range(0, num_passes):  # parallel
         bit_offset = p * num_bits_per_pass
+        if KEY_BITS > 32:
+            mismatch_found = tl.zeros((), dtype=tl.uint64)
+        else:
+            mismatch_found = tl.zeros((), dtype=tl.uint32)
         for r_start in range(0, r, TILE_R):  # parallel
             bin_indices = r_start + tl.arange(0, TILE_R)
             # radix_sort bounds n < 2**30, so all bin counts fit in int32.
@@ -144,6 +155,11 @@ def compute_global_hist_kernel(
                 arr = tl.load(arr_ptr + pid_m * n + n_offsets, mask=mask)
                 arr = convert_to_uint_preverse_order(arr, descending)
                 key = (arr >> bit_offset) & bfe_mask  # (TILE_N, )
+                if identity_mismatch_ptr is not None:
+                    if (p == 0) & (r_start == 0):
+                        differences = tl.where(mask, arr ^ (arr >> num_bits_per_pass), 0)
+                        differences = differences.to(mismatch_found.dtype)
+                        mismatch_found |= tl.reduce(differences, 0, _combine_or)
                 matches = tl.where(
                     mask, (bin_indices[:, None] == key), False
                 )  # (TILE_R, TILE_N)
@@ -154,6 +170,13 @@ def compute_global_hist_kernel(
                 local_sum,
                 sem="relaxed",
             )
+        if identity_mismatch_ptr is not None:
+            if p == 0:
+                tl.atomic_or(identity_mismatch_ptr + pid_m * 2,
+                             mismatch_found.to(tl.uint32), sem="relaxed")
+                if KEY_BITS > 32:
+                    tl.atomic_or(identity_mismatch_ptr + pid_m * 2 + 1,
+                                 (mismatch_found >> 32).to(tl.uint32), sem="relaxed")
 
 
 @triton.jit
@@ -301,6 +324,7 @@ def _sweep_two_bin_rank(
     M, N, NT,
     TILE_N: tl.constexpr, TILE_R: tl.constexpr, k_bits: tl.constexpr,
     descending: tl.constexpr,
+    identity_flags_ptr=None,
 ):
     tl.static_assert(TILE_N < 65536, "Each packed counter must fit in 16 bits")
     tl.static_assert(TILE_R % 2 == 0)
@@ -312,41 +336,53 @@ def _sweep_two_bin_rank(
     group = tl.program_id(1)
     cols = tile * TILE_N + tl.arange(0, TILE_N)
     valid = cols < N
-    x = tl.load(X + row * N + cols, valid)
-    key = (convert_to_uint_preverse_order(x, descending) >> SHIFT) & (R - 1)
-    if I is not None:
-        idx = tl.load(I + row * N + cols, valid)
-    begin = group * TILE_R
-    end = tl.minimum(begin + TILE_R, R)
-    for b in range(begin, end, 2):
-        match0 = valid & (key == b)
-        match1 = valid & (key == b + 1)
-        weights = match0.to(tl.uint32) | (match1.to(tl.uint32) << 16)
-        aggregate = tl.sum(weights, 0)
-        count0 = aggregate & 65535
-        count1 = aggregate >> 16
-        # Both counters and all inter-CTA states remain separate.
-        before0 = _sweep_pair_lookback(STATUS, row, tile, b, NT, R, count0)
-        before1 = _sweep_pair_lookback(STATUS, row, tile, b + 1, NT, R, count1)
-        if aggregate != 0:
-            packed_rank = tl.cumsum(weights, 0) - weights
-            if count0 != 0:
-                base0 = tl.load(GLOBAL_PREFIX + row * (PASSES * R) + PASS * R + b)
-                pos0 = base0 + before0 + (packed_rank & 65535)
-                tl.store(Y + row * N + pos0, x, match0)
-                if I is not None:
-                    tl.store(J + row * N + pos0, idx, match0)
-            if count1 != 0:
-                base1 = tl.load(GLOBAL_PREFIX + row * (PASSES * R) + PASS * R + b + 1)
-                pos1 = base1 + before1 + (packed_rank >> 16)
-                tl.store(Y + row * N + pos1, x, match1)
-                if I is not None:
-                    tl.store(J + row * N + pos1, idx, match1)
+    identity = tl.full((), False, tl.int1)
+    if identity_flags_ptr is not None:
+        identity = tl.load(identity_flags_ptr + row * PASSES + PASS) != 0
+    if identity:
+        if group == 0:
+            values = tl.load(X + row * N + cols, valid)
+            tl.store(Y + row * N + cols, values, valid)
+            if I is not None:
+                indices = tl.load(I + row * N + cols, valid)
+                tl.store(J + row * N + cols, indices, valid)
+    else:
+        x = tl.load(X + row * N + cols, valid)
+        key = (convert_to_uint_preverse_order(x, descending) >> SHIFT) & (R - 1)
+        if I is not None:
+            idx = tl.load(I + row * N + cols, valid)
+        begin = group * TILE_R
+        end = tl.minimum(begin + TILE_R, R)
+        for b in range(begin, end, 2):
+            match0 = valid & (key == b)
+            match1 = valid & (key == b + 1)
+            weights = match0.to(tl.uint32) | (match1.to(tl.uint32) << 16)
+            aggregate = tl.sum(weights, 0)
+            count0 = aggregate & 65535
+            count1 = aggregate >> 16
+            # Both counters and all inter-CTA states remain separate.
+            before0 = _sweep_pair_lookback(STATUS, row, tile, b, NT, R, count0)
+            before1 = _sweep_pair_lookback(STATUS, row, tile, b + 1, NT, R, count1)
+            if aggregate != 0:
+                packed_rank = tl.cumsum(weights, 0) - weights
+                if count0 != 0:
+                    base0 = tl.load(GLOBAL_PREFIX + row * (PASSES * R) + PASS * R + b)
+                    pos0 = base0 + before0 + (packed_rank & 65535)
+                    tl.store(Y + row * N + pos0, x, match0)
+                    if I is not None:
+                        tl.store(J + row * N + pos0, idx, match0)
+                if count1 != 0:
+                    base1 = tl.load(GLOBAL_PREFIX + row * (PASSES * R) + PASS * R + b + 1)
+                    pos1 = base1 + before1 + (packed_rank >> 16)
+                    tl.store(Y + row * N + pos1, x, match1)
+                    if I is not None:
+                        tl.store(J + row * N + pos1, idx, match1)
 
 
 @triton.jit
 def _histogram_exclusive_scan_kernel(
-    hist_ptr, prefix_ptr, NUM_BINS: tl.constexpr
+    hist_ptr, prefix_ptr, NUM_BINS: tl.constexpr,
+    mismatch_ptr=None, identity_ptr=None, N_PASSES: tl.constexpr=1, BITS_PER_PASS: tl.constexpr=4,
 ):
     # radix_sort bounds each nonnegative row sum by n < 2**30.
     # Keep address arithmetic wide; only bounded counts/prefixes use INT32.
@@ -355,6 +391,16 @@ def _histogram_exclusive_scan_kernel(
     counts = tl.load(hist_ptr + row * NUM_BINS + bins).to(tl.int32)
     prefix = tl.cumsum(counts, axis=0) - counts
     tl.store(prefix_ptr + row * NUM_BINS + bins, prefix.to(tl.uint32))
+    if identity_ptr is not None:
+        uniform = tl.sum((counts != 0).to(tl.int32), 0) == 1
+        repeated = tl.full((), False, tl.int1)
+        if row % N_PASSES != 0:
+            bit_offset = ((row % N_PASSES) - 1) * BITS_PER_PASS
+            word = tl.load(mismatch_ptr + (row // N_PASSES) * 2 + bit_offset // 32)
+            repeated = (
+                ((word >> (bit_offset % 32)) & (NUM_BINS - 1)) == 0
+            )
+        tl.store(identity_ptr + row, (uniform | repeated).to(tl.uint32))
 
 
 def radix_sort(arr, k_bits=8, descending=False):
@@ -379,6 +425,15 @@ def radix_sort(arr, k_bits=8, descending=False):
         global_hist = torch.zeros(
             (m, n_passes, num_bins), device=arr.device, dtype=torch.int32
         )
+        # Packed mismatch words require digit fields not to straddle a word.
+        if 32 % k_bits == 0:
+            identity_mismatch = torch.zeros(
+                (m, 2), device=arr.device, dtype=torch.uint32
+            )
+            identity_flags = torch.empty((m,n_passes),device=arr.device,dtype=torch.uint32)
+        else:
+            identity_mismatch = None
+            identity_flags = None
         compute_global_hist_kernel[grid_for_global_hist](
             arr,
             global_hist,
@@ -390,10 +445,14 @@ def radix_sort(arr, k_bits=8, descending=False):
             TILE_R,
             k_bits,
             descending,
+            identity_mismatch,
+            KEY_BITS=num_bits,
         )
         ex_cumsum_bins = torch.empty_like(global_hist, dtype=torch.uint32)
         _histogram_exclusive_scan_kernel[(m * n_passes,)](
-            global_hist, ex_cumsum_bins, NUM_BINS=num_bins, num_warps=4
+            global_hist, ex_cumsum_bins, NUM_BINS=num_bins, num_warps=4,
+            mismatch_ptr=identity_mismatch, identity_ptr=identity_flags,
+            N_PASSES=n_passes, BITS_PER_PASS=k_bits,
         )
 
         # sort
@@ -422,6 +481,10 @@ def radix_sort(arr, k_bits=8, descending=False):
             (m, num_bins, grid_n), device=arr.device, dtype=torch.uint32
         )
 
+        sweep_kwargs = (
+            {"identity_flags_ptr": identity_flags}
+            if digit_sweep is _sweep_two_bin_rank else {}
+        )
         for i in range(0, n_passes):
             if i == n_passes - 1:
                 # Intermediate indices are bounded by n-1 < 2**30.
@@ -446,6 +509,7 @@ def radix_sort(arr, k_bits=8, descending=False):
                 TILE_R,
                 k_bits,
                 descending,
+                **sweep_kwargs,
             )
             # print(f"< sorted last {bit_offset + k_bits:>2d} bits: {arr_out}")
             arr_in, arr_out = arr_out, arr_in
