@@ -273,6 +273,78 @@ def sweep(
 
 
 @triton.jit
+def _sweep_pair_lookback(S, row, tile, bin_id, NT, R: tl.constexpr, count):
+    aggregate_mask: tl.constexpr = 1 << 30
+    inclusive_mask: tl.constexpr = 1 << 31
+    value_mask: tl.constexpr = (1 << 30) - 1
+    offset = row * (R * NT) + bin_id * NT + tile
+    tl.store(S + offset, aggregate_mask | count, cache_modifier=".cg")
+    prefix = tl.zeros((), tl.uint32)
+    prev = tile - 1
+    while prev >= 0:
+        location = row * (R * NT) + bin_id * NT + prev
+        record = tl.load(S + location, volatile=True)
+        while record == 0:
+            record = tl.load(S + location, volatile=True)
+        prefix += record & value_mask
+        if (record & aggregate_mask) == aggregate_mask:
+            prev -= 1
+        else:
+            prev = -1
+    tl.store(S + offset, inclusive_mask | (prefix + count), cache_modifier=".cg")
+    return prefix
+
+
+@triton.jit
+def _sweep_two_bin_rank(
+    X, I, Y, J, GLOBAL_PREFIX, STATUS, PASSES, PASS, SHIFT,
+    M, N, NT,
+    TILE_N: tl.constexpr, TILE_R: tl.constexpr, k_bits: tl.constexpr,
+    descending: tl.constexpr,
+):
+    tl.static_assert(TILE_N < 65536, "Each packed counter must fit in 16 bits")
+    tl.static_assert(TILE_R % 2 == 0)
+    R: tl.constexpr = 2 ** k_bits
+    tl.static_assert(R % 2 == 0)
+    pid = tl.program_id(0)
+    row = pid % M
+    tile = pid // M
+    group = tl.program_id(1)
+    cols = tile * TILE_N + tl.arange(0, TILE_N)
+    valid = cols < N
+    x = tl.load(X + row * N + cols, valid)
+    key = (convert_to_uint_preverse_order(x, descending) >> SHIFT) & (R - 1)
+    if I is not None:
+        idx = tl.load(I + row * N + cols, valid)
+    begin = group * TILE_R
+    end = tl.minimum(begin + TILE_R, R)
+    for b in range(begin, end, 2):
+        match0 = valid & (key == b)
+        match1 = valid & (key == b + 1)
+        weights = match0.to(tl.uint32) | (match1.to(tl.uint32) << 16)
+        aggregate = tl.sum(weights, 0)
+        count0 = aggregate & 65535
+        count1 = aggregate >> 16
+        # Both counters and all inter-CTA states remain separate.
+        before0 = _sweep_pair_lookback(STATUS, row, tile, b, NT, R, count0)
+        before1 = _sweep_pair_lookback(STATUS, row, tile, b + 1, NT, R, count1)
+        if aggregate != 0:
+            packed_rank = tl.cumsum(weights, 0) - weights
+            if count0 != 0:
+                base0 = tl.load(GLOBAL_PREFIX + row * (PASSES * R) + PASS * R + b)
+                pos0 = base0 + before0 + (packed_rank & 65535)
+                tl.store(Y + row * N + pos0, x, match0)
+                if I is not None:
+                    tl.store(J + row * N + pos0, idx, match0)
+            if count1 != 0:
+                base1 = tl.load(GLOBAL_PREFIX + row * (PASSES * R) + PASS * R + b + 1)
+                pos1 = base1 + before1 + (packed_rank >> 16)
+                tl.store(Y + row * N + pos1, x, match1)
+                if I is not None:
+                    tl.store(J + row * N + pos1, idx, match1)
+
+
+@triton.jit
 def _histogram_exclusive_scan_kernel(
     hist_ptr, prefix_ptr, NUM_BINS: tl.constexpr
 ):
@@ -339,6 +411,12 @@ def radix_sort(arr, k_bits=8, descending=False):
         TILE_N = 2048
         grid_n = triton.cdiv(n, TILE_N)
         grid_for_sweep = (m * grid_n, grid_r)
+        # Packed fields are exact only within these structural bounds.
+        digit_sweep = (
+            _sweep_two_bin_rank
+            if TILE_N < 65536 and TILE_R % 2 == 0 and num_bins % 2 == 0
+            else sweep
+        )
 
         status = torch.empty(
             (m, num_bins, grid_n), device=arr.device, dtype=torch.uint32
@@ -351,7 +429,7 @@ def radix_sort(arr, k_bits=8, descending=False):
                 indices_out = torch.empty_like(indices_in, dtype=torch.int64)
             bit_offset = i * k_bits
             status.zero_()
-            sweep[grid_for_sweep](
+            digit_sweep[grid_for_sweep](
                 arr_in,
                 indices_in,
                 arr_out,
