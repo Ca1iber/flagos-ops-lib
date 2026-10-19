@@ -112,7 +112,7 @@ def _combine_or(a, b):
     return a | b
 
 
-
+# histogram 的主输出是“每个桶有多少个元素”，不是排好序的分数
 @triton.jit
 def compute_global_hist_kernel(
     arr_ptr,
@@ -290,6 +290,7 @@ def sweep(
 
             # scatter
             # 只写出属于当前桶的元素
+            # sweep 会有两份输出，一份是重排后的分数，以及对应的原始索引
             tl.store(out_ptr + pid_m * N + pos, arr, mask=matches)
             if associate_arr_ptr is not None:
                 tl.store(associate_out_ptr + pid_m * N + pos, associate_arr, mask=matches)
