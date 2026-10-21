@@ -96,6 +96,7 @@ from flag_gems.fused.packed_bundle import (
     packed_mlp,
     packed_projection,
 )
+from flag_gems.fused.packed_mlp_m64 import packed_mlp_m64
 from flag_gems.fused.packed_swiglu import (
     pack_gate_up_input,
     pack_gate_up_weight,
@@ -187,6 +188,7 @@ __all__ = [
     "pack_seq_triton",
     "pack_gate_up_input",
     "pack_gate_up_weight",
+    "packed_mlp_m64",
     "packed_gate_up_silu",
     "pack_linear_weight",
     "packed_projection",
