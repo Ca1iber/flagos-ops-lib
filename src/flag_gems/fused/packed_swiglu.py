@@ -7,6 +7,8 @@ fallback. Unsupported model shapes must be handled by the framework.
 Weight packing is a caller-managed, one-time operation for frozen weights.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -16,6 +18,8 @@ from flag_gems.runtime import torch_device_fn
 
 # Legacy M2048 allocation constants; computation derives rows from the input.
 M, K, H = 2048, 2048, 6144
+# Opt-in until official service verification; small-row copy_ stays unchanged.
+_TILED_INPUT_PACK_ENABLED = os.getenv("FLAGGEMS_METAX_TILED_INPUT_PACK", "0") == "1"
 INPUT_PACKED_SHAPE = (K // 32, M, 32)
 WEIGHT_PACKED_SHAPE = (H // 64, K // 32, 128, 32)
 
@@ -112,6 +116,15 @@ def pack_gate_up_weight(weight):
     )
 
 
+@triton.jit(do_not_specialize=["M", "XS0"])
+def _tiled_pack_gate_up_input(X, P, M, XS0):
+    rm = tl.program_id(0) * 32 + tl.arange(0, 32)
+    rk = tl.program_id(1) * 128 + tl.arange(0, 128)
+    value = tl.load(X + rm[:, None] * XS0 + rk[None, :], mask=rm[:, None] < M, other=0)
+    offset = (rk[None, :] // 32) * M * 32 + rm[:, None] * 32 + rk[None, :] % 32
+    tl.store(P + offset, value, mask=rm[:, None] < M)
+
+
 def pack_gate_up_input(x, *, out=None):
     """Copy X to K32-major layout, optionally into a caller-owned workspace."""
     m = _input_rows(x, K)
@@ -126,7 +139,22 @@ def pack_gate_up_input(x, *, out=None):
     )
     if _overlaps(x, out):
         raise ValueError("input workspace must not overlap x")
-    out.copy_(x.reshape(m, K // 32, 32).permute(1, 0, 2))
+    # Retain ordinary copy semantics outside inference mode and the measured range.
+    # The index bound also covers a non-contiguous or broadcast source row stride.
+    if (
+        _TILED_INPUT_PACK_ENABLED
+        and runtime.device.vendor_name == "metax"
+        and x.is_cuda
+        and torch.is_inference_mode_enabled()
+        and 1792 <= m <= 2048
+        and 0 <= x.stride(0)
+        and (m - 1) * x.stride(0) + K < 2**31
+    ):
+        _tiled_pack_gate_up_input[(triton.cdiv(m, 32), K // 128)](
+            x, out, m, x.stride(0), num_warps=4, num_stages=1,
+        )
+    else:
+        out.copy_(x.reshape(m, K // 32, 32).permute(1, 0, 2))
     return out
 
 
